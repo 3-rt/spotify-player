@@ -78,14 +78,16 @@ pub fn run(state: &SharedState, mut terminal: Terminal) -> Result<()> {
 pub fn init_terminal() -> Result<Terminal> {
     let mut stdout = std::io::stdout();
     crossterm::terminal::enable_raw_mode()?;
+    // Clear directly rather than via `Terminal::clear`, which first queries the cursor position
+    // and fails if the terminal doesn't answer in time (e.g. in a tmux pane that is just starting).
     crossterm::execute!(
         stdout,
         crossterm::terminal::EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture
+        crossterm::event::EnableMouseCapture,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
     )?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
-    let mut terminal = ratatui::Terminal::new(backend)?;
-    terminal.clear()?;
+    let terminal = ratatui::Terminal::new(backend)?;
     Ok(terminal)
 }
 
