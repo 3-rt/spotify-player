@@ -419,6 +419,21 @@ impl Track {
 
         Track::try_from_full_track_with_date(track, item.added_at)
     }
+
+    /// tries to convert from a `librespot_metadata::Track` into `Track`
+    pub fn try_from_librespot_track(track: librespot_metadata::Track) -> Option<Self> {
+        Some(Self {
+            id: TrackId::from_uri(&track.id.to_uri().ok()?)
+                .ok()?
+                .into_static(),
+            name: track.name,
+            artists: from_librespot_artists(&track.artists),
+            album: Album::try_from_librespot_album(track.album),
+            duration: std::time::Duration::from_millis(u64::try_from(track.duration).ok()?),
+            explicit: track.is_explicit,
+            added_at: 0,
+        })
+    }
 }
 
 impl std::fmt::Display for Track {
@@ -452,6 +467,40 @@ impl Album {
                     "compilation" => Some(rspotify::model::AlbumType::Compilation),
                     _ => None,
                 }),
+            added_at: 0,
+        })
+    }
+
+    /// tries to convert from a `librespot_metadata::Album` into `Album`
+    pub fn try_from_librespot_album(album: librespot_metadata::Album) -> Option<Self> {
+        use librespot_metadata::album::AlbumType;
+
+        let date = album.date.as_utc();
+        // librespot reports a missing release date as year 0
+        let release_date = if date.year() == 0 {
+            String::new()
+        } else {
+            format!(
+                "{:04}-{:02}-{:02}",
+                date.year(),
+                u8::from(date.month()),
+                date.day()
+            )
+        };
+        Some(Self {
+            id: AlbumId::from_uri(&album.id.to_uri().ok()?)
+                .ok()?
+                .into_static(),
+            name: album.name,
+            release_date,
+            artists: from_librespot_artists(&album.artists),
+            typ: match album.album_type {
+                AlbumType::ALBUM => Some(rspotify::model::AlbumType::Album),
+                // the Web API reports EPs as singles
+                AlbumType::SINGLE | AlbumType::EP => Some(rspotify::model::AlbumType::Single),
+                AlbumType::COMPILATION => Some(rspotify::model::AlbumType::Compilation),
+                AlbumType::AUDIOBOOK | AlbumType::PODCAST => None,
+            },
             added_at: 0,
         })
     }
@@ -542,6 +591,21 @@ fn from_simplified_artists_to_artists(
     artists
         .into_iter()
         .filter_map(Artist::try_from_simplified_artist)
+        .collect()
+}
+
+/// a helper function to convert `librespot_metadata` artists into a vector of `Artist`.
+fn from_librespot_artists(artists: &[librespot_metadata::Artist]) -> Vec<Artist> {
+    artists
+        .iter()
+        .filter_map(|artist| {
+            Some(Artist {
+                id: ArtistId::from_uri(&artist.id.to_uri().ok()?)
+                    .ok()?
+                    .into_static(),
+                name: artist.name.clone(),
+            })
+        })
         .collect()
 }
 
