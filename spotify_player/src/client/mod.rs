@@ -20,7 +20,9 @@ use std::io::Write;
 use anyhow::Context as _;
 use anyhow::Result;
 
+use futures::StreamExt as _;
 use librespot_core::SpotifyUri;
+use librespot_metadata::Metadata as _;
 #[cfg(feature = "streaming")]
 use parking_lot::Mutex;
 
@@ -37,6 +39,9 @@ use middleware::SpotifyApiMiddleware;
 pub use request::*;
 use serde::Deserialize;
 pub(crate) use spotify::{PkceWebApiClient, WebApiClient};
+
+/// Maximum number of concurrent track metadata requests when building a radio
+const RADIO_TRACK_REQUEST_CONCURRENCY: usize = 10;
 
 fn patch_missing_track_external_ids(response: &mut serde_json::Value) {
     let Some(item) = response.get_mut("item") else {
@@ -1104,17 +1109,30 @@ impl AppClient {
         let track_ids = serde_json::from_slice::<RadioStationResponse>(&response.payload[0])?
             .tracks
             .into_iter()
-            .filter_map(|t| TrackId::from_id(t.original_gid).ok());
+            .filter_map(|t| librespot_core::SpotifyId::from_base62(&t.original_gid).ok());
 
-        // Retrieve tracks based on IDs
-        #[allow(deprecated)]
-        let tracks = self
-            .tracks(track_ids, Some(rspotify::model::Market::FromToken))
-            .await?;
-        let mut tracks: Vec<_> = tracks
-            .into_iter()
-            .filter_map(Track::try_from_full_track)
-            .collect();
+        // Retrieve tracks through librespot's metadata API rather than the Web API's batch
+        // tracks endpoint, which is unavailable to Development Mode apps (403).
+        let mut tracks: Vec<Track> =
+            futures::stream::iter(track_ids)
+                .map(|id| {
+                    let session = session.clone();
+                    async move {
+                        librespot_metadata::Track::get(&session, &SpotifyUri::Track { id }).await
+                    }
+                })
+                .buffered(RADIO_TRACK_REQUEST_CONCURRENCY)
+                .filter_map(|result| async move {
+                    match result {
+                        Ok(track) => Track::try_from_librespot_track(track),
+                        Err(err) => {
+                            tracing::warn!("Failed to get a radio track's metadata: {err:#}");
+                            None
+                        }
+                    }
+                })
+                .collect()
+                .await;
 
         // Track-seeded radios in the official Spotify clients include the seed track itself
         // as the first item in the generated session.
