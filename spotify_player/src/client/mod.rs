@@ -41,6 +41,10 @@ pub(crate) use spotify::{PkceWebApiClient, WebApiClient};
 
 /// Maximum number of concurrent track metadata requests when building a radio
 const RADIO_TRACK_REQUEST_CONCURRENCY: usize = 10;
+/// Maximum number of tracks per librespot extended metadata request when building a playlist
+const PLAYLIST_TRACK_METADATA_BATCH_SIZE: usize = 100;
+/// Maximum number of concurrent extended metadata requests when building a playlist
+const PLAYLIST_TRACK_METADATA_CONCURRENCY: usize = 4;
 
 fn patch_missing_track_external_ids(response: &mut serde_json::Value) {
     let Some(item) = response.get_mut("item") else {
@@ -1540,6 +1544,15 @@ impl AppClient {
         let playlist_uri = playlist_id.uri();
         tracing::info!("Get playlist context: {}", playlist_uri);
 
+        // The Web API omits the items of playlists the user doesn't own for Development Mode
+        // apps, and the ncspot fallback is usually rate limited, so prefer librespot.
+        match self.librespot_playlist_context(playlist_id.as_ref()).await {
+            Ok(context) => return Ok(context),
+            Err(err) => tracing::warn!(
+                "Failed to get playlist context through librespot, falling back to the Web API: {err:#}"
+            ),
+        }
+
         let playlist = self
             .playlist(
                 playlist_id.clone(),
@@ -1562,6 +1575,60 @@ impl AppClient {
             playlist: playlist.into(),
             tracks,
         })
+    }
+
+    /// Get a playlist context data through librespot, without using Web API quota
+    async fn librespot_playlist_context(&self, playlist_id: PlaylistId<'_>) -> Result<Context> {
+        let session = self.spotify.session().await;
+        let uri = SpotifyUri::Playlist {
+            id: librespot_core::SpotifyId::from_base62(playlist_id.id())?,
+            user: None,
+        };
+        let playlist = librespot_metadata::Playlist::get(&session, &uri)
+            .await
+            .context("get playlist")?;
+        if playlist.contents.is_truncated {
+            anyhow::bail!("playlist contents are truncated");
+        }
+        let SpotifyUri::Playlist {
+            user: Some(owner_id),
+            ..
+        } = &playlist.id
+        else {
+            anyhow::bail!("playlist has no owner");
+        };
+
+        let items = playlist
+            .contents
+            .items
+            .iter()
+            .filter(|item| matches!(item.id, SpotifyUri::Track { .. }))
+            .collect::<Vec<_>>();
+        let track_uris = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+
+        let (owner_name, tracks_by_uri) = futures::join!(
+            librespot_user_display_name(&session, owner_id),
+            librespot_tracks(&session, &track_uris),
+        );
+        let owner_name = owner_name.unwrap_or_else(|err| {
+            tracing::warn!("Failed to get the display name of user {owner_id}: {err:#}");
+            owner_id.clone()
+        });
+        let tracks_by_uri = tracks_by_uri?;
+
+        let tracks = items
+            .into_iter()
+            .filter_map(|item| {
+                let mut track = tracks_by_uri.get(&item.id.to_uri().ok()?)?.clone();
+                track.added_at =
+                    u64::try_from(item.attributes.timestamp.as_timestamp_ms() / 1000).unwrap_or(0);
+                Some(track)
+            })
+            .collect::<Vec<_>>();
+
+        let playlist = Playlist::try_from_librespot_playlist(&playlist, owner_name)
+            .context("convert librespot playlist into Playlist")?;
+        Ok(Context::Playlist { playlist, tracks })
     }
 
     /// Get an album context data
@@ -2124,11 +2191,147 @@ fn move_seed_track_to_front(tracks: &mut Vec<Track>, seed_track: Track) {
     tracks.insert(0, seed_track);
 }
 
+/// Gets a user's display name through librespot
+async fn librespot_user_display_name(
+    session: &librespot_core::Session,
+    username: &str,
+) -> Result<String> {
+    #[derive(Debug, Deserialize)]
+    struct UserProfile {
+        name: String,
+    }
+
+    let response = session
+        .spclient()
+        .get_user_profile(username, Some(0), Some(0))
+        .await?;
+    Ok(serde_json::from_slice::<UserProfile>(&response)?.name)
+}
+
+/// Checks whether the user can play a track, matching the Web API's `is_playable`: tracks that are
+/// taken down or restricted in the user's country are unplayable unless they can be relinked to
+/// an alternative. The restriction check mirrors librespot's private one used at playback.
+fn is_playable_for_user(
+    user_data: &librespot_core::session::UserData,
+    track: &librespot_metadata::Track,
+) -> bool {
+    use librespot_core::date::Date;
+
+    if !track.alternatives.is_empty() {
+        return true;
+    }
+    // taken-down tracks have no audio files
+    if track.files.is_empty() {
+        return false;
+    }
+    let now = Date::now_utc();
+    if now < track.earliest_live_timestamp
+        || (!track.availability.is_empty() && !track.availability.iter().any(|a| now >= a.start))
+    {
+        return false;
+    }
+
+    let catalogue = user_data
+        .attributes
+        .get("catalogue")
+        .map_or("premium", String::as_str);
+    let country = &user_data.country;
+    for restriction in track
+        .restrictions
+        .iter()
+        .filter(|r| r.catalogue_strs.iter().any(|c| c == catalogue))
+    {
+        if let Some(allowed) = &restriction.countries_allowed {
+            return allowed.iter().any(|c| c == country);
+        }
+        if let Some(forbidden) = &restriction.countries_forbidden {
+            return !forbidden.iter().any(|c| c == country);
+        }
+    }
+    true
+}
+
+/// Gets the metadata of the tracks the user can play through librespot's batched extended
+/// metadata API, keyed by track URI.
+async fn librespot_tracks(
+    session: &librespot_core::Session,
+    uris: &[SpotifyUri],
+) -> Result<HashMap<String, Track>> {
+    use librespot_protocol::{
+        extended_metadata::{BatchedEntityRequest, EntityRequest, ExtensionQuery},
+        extension_kind::ExtensionKind,
+    };
+    use protobuf::Message as _;
+
+    let requests = uris
+        .chunks(PLAYLIST_TRACK_METADATA_BATCH_SIZE)
+        .map(|chunk| BatchedEntityRequest {
+            entity_request: chunk
+                .iter()
+                .filter_map(|uri| uri.to_uri().ok())
+                .map(|entity_uri| EntityRequest {
+                    entity_uri,
+                    query: vec![ExtensionQuery {
+                        extension_kind: protobuf::EnumOrUnknown::new(ExtensionKind::TRACK_V4),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    let responses = futures::stream::iter(requests)
+        .map(|request| {
+            let session = session.clone();
+            async move { session.spclient().get_extended_metadata(request).await }
+        })
+        .buffered(PLAYLIST_TRACK_METADATA_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+    let user_data = session.user_data();
+    let mut tracks = HashMap::new();
+    for response in responses {
+        let response = response.context("get tracks' extended metadata")?;
+        for mut data in response
+            .extended_metadata
+            .into_iter()
+            .flat_map(|array| array.extension_data)
+        {
+            let Some(value) = data.extension_data.take() else {
+                continue;
+            };
+            let track = librespot_protocol::metadata::Track::parse_from_bytes(&value.value)
+                .map_err(anyhow::Error::from)
+                .and_then(|message| {
+                    let uri = SpotifyUri::from_uri(&data.entity_uri)?;
+                    Ok(librespot_metadata::Track::parse(&message, &uri)?)
+                });
+            match track {
+                Ok(track) => {
+                    if !is_playable_for_user(&user_data, &track) {
+                        continue;
+                    }
+                    if let Some(track) = Track::try_from_librespot_track(track) {
+                        tracks.insert(data.entity_uri, track);
+                    }
+                }
+                Err(err) => tracing::warn!(
+                    "Failed to parse the metadata of track {}: {err:#}",
+                    data.entity_uri
+                ),
+            }
+        }
+    }
+    Ok(tracks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        move_seed_track_to_front, parse_current_playback_response, spotify, AppClient,
-        PlayerRequest, WebApiClient,
+        is_playable_for_user, move_seed_track_to_front, parse_current_playback_response, spotify,
+        AppClient, PlayerRequest, WebApiClient,
     };
     use crate::{
         auth::AuthConfig,
@@ -2408,5 +2611,102 @@ mod tests {
             .unwrap();
 
         assert!(matches!(playback.item, Some(PlayableItem::Track(_))));
+    }
+
+    mod playable_for_user {
+        use super::is_playable_for_user;
+        use librespot_core::session::UserData;
+        use librespot_metadata::Metadata as _;
+        use librespot_protocol::metadata::{audio_file, AudioFile, Restriction, Track};
+
+        fn track(configure: impl FnOnce(&mut Track)) -> librespot_metadata::Track {
+            let mut message = Track::new();
+            message.set_gid(vec![4; 16]);
+            message.album.mut_or_insert_default().set_gid(vec![1; 16]);
+            configure(&mut message);
+            let uri = librespot_core::SpotifyUri::from_uri("spotify:track:3n3Ppam7vgaVa1iaRUc9Lp")
+                .unwrap();
+            librespot_metadata::Track::parse(&message, &uri).unwrap()
+        }
+
+        fn audio_file() -> AudioFile {
+            let mut file = AudioFile::new();
+            file.set_file_id(vec![2; 20]);
+            file.set_format(audio_file::Format::OGG_VORBIS_320);
+            file
+        }
+
+        fn restriction(
+            catalogue: Option<&str>,
+            configure: impl FnOnce(&mut Restriction),
+        ) -> Restriction {
+            let mut restriction = Restriction::new();
+            restriction.catalogue_str = catalogue.into_iter().map(String::from).collect();
+            configure(&mut restriction);
+            restriction
+        }
+
+        fn user_in(country: &str) -> UserData {
+            UserData {
+                country: country.to_string(),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn track_with_audio_files_is_playable() {
+            let track = track(|t| t.file.push(audio_file()));
+            assert!(is_playable_for_user(&user_in("CA"), &track));
+        }
+
+        #[test]
+        fn taken_down_track_is_not_playable() {
+            // what the metadata API returns for tracks the Web API marks with `restrictions.reason = "market"`
+            let track = track(|t| {
+                t.restriction.push(restriction(None, |r| {
+                    r.set_countries_allowed(String::new())
+                }));
+            });
+            assert!(!is_playable_for_user(&user_in("CA"), &track));
+        }
+
+        #[test]
+        fn relinked_track_is_playable() {
+            let track = track(|t| {
+                let mut alternative = Track::new();
+                alternative.set_gid(vec![3; 16]);
+                t.alternative.push(alternative);
+            });
+            assert!(is_playable_for_user(&user_in("CA"), &track));
+        }
+
+        #[test]
+        fn country_restrictions_apply_to_the_user_catalogue() {
+            let forbidden = track(|t| {
+                t.file.push(audio_file());
+                t.restriction.push(restriction(Some("premium"), |r| {
+                    r.set_countries_forbidden("CAUS".to_string());
+                }));
+            });
+            assert!(!is_playable_for_user(&user_in("CA"), &forbidden));
+            assert!(is_playable_for_user(&user_in("GB"), &forbidden));
+
+            let allowed_elsewhere = track(|t| {
+                t.file.push(audio_file());
+                t.restriction.push(restriction(Some("premium"), |r| {
+                    r.set_countries_allowed("US".to_string());
+                }));
+            });
+            assert!(!is_playable_for_user(&user_in("CA"), &allowed_elsewhere));
+            assert!(is_playable_for_user(&user_in("US"), &allowed_elsewhere));
+
+            let other_catalogue = track(|t| {
+                t.file.push(audio_file());
+                t.restriction.push(restriction(Some("free"), |r| {
+                    r.set_countries_forbidden("CA".to_string());
+                }));
+            });
+            assert!(is_playable_for_user(&user_in("CA"), &other_catalogue));
+        }
     }
 }
