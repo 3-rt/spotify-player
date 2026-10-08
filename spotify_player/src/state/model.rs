@@ -630,11 +630,6 @@ impl From<rspotify::model::SimplifiedPlaylist> for Playlist {
 
 impl From<rspotify::model::FullPlaylist> for Playlist {
     fn from(playlist: rspotify::model::FullPlaylist) -> Self {
-        // remove HTML tags from the description
-        let re = regex::Regex::new("(<.*?>|</.*?>)").expect("valid regex");
-        let desc = playlist.description.unwrap_or_default();
-        let desc = decode_html_entities(&re.replace_all(&desc, "")).to_string();
-
         Self {
             id: playlist.id,
             name: playlist.name,
@@ -643,11 +638,45 @@ impl From<rspotify::model::FullPlaylist> for Playlist {
                 playlist.owner.display_name.unwrap_or_default(),
                 playlist.owner.id,
             ),
-            desc,
+            desc: plain_playlist_description(&playlist.description.unwrap_or_default()),
             current_folder_id: 0,
             snapshot_id: playlist.snapshot_id,
         }
     }
+}
+
+impl Playlist {
+    /// tries to convert from a `librespot_metadata::Playlist` into `Playlist`
+    pub fn try_from_librespot_playlist(
+        playlist: &librespot_metadata::Playlist,
+        owner_name: String,
+    ) -> Option<Self> {
+        use base64::Engine as _;
+
+        let librespot_core::SpotifyUri::Playlist {
+            id,
+            user: Some(owner_id),
+        } = &playlist.id
+        else {
+            return None;
+        };
+        Some(Self {
+            id: PlaylistId::from_id(id.to_base62().ok()?).ok()?,
+            name: playlist.attributes.name.clone(),
+            collaborative: playlist.attributes.is_collaborative,
+            owner: (owner_name, UserId::from_id(owner_id.clone()).ok()?),
+            desc: plain_playlist_description(&playlist.attributes.description),
+            current_folder_id: 0,
+            // the Web API's snapshot ID is the base64-encoded playlist revision
+            snapshot_id: base64::engine::general_purpose::STANDARD.encode(&playlist.revision),
+        })
+    }
+}
+
+/// removes HTML tags and entities from a playlist description
+fn plain_playlist_description(desc: &str) -> String {
+    let re = regex::Regex::new("(<.*?>|</.*?>)").expect("valid regex");
+    decode_html_entities(&re.replace_all(desc, "")).to_string()
 }
 
 impl std::fmt::Display for Playlist {
