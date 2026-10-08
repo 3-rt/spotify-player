@@ -408,7 +408,14 @@ impl AppClient {
                 if let (Some(shuffle), Some(playback)) = (shuffle, playback.as_mut()) {
                     playback.shuffle_state = shuffle;
                 }
-                let device_id = playback.as_ref().and_then(|p| p.device_id.as_deref());
+                let device_id = match playback.as_ref().and_then(|p| p.device_id.clone()) {
+                    Some(device_id) => Some(device_id),
+                    // Spotify drops a paused playback after some idle time. Starting a playback
+                    // without a target device then fails with 404 (no active device), so target
+                    // the integrated device, which the request activates.
+                    None => self.integrated_device_id().await,
+                };
+                let device_id = device_id.as_deref();
                 self.start_playback(p, device_id).await?;
                 // For some reasons, when starting a new playback, the integrated `spotify_player`
                 // client doesn't respect the initial shuffle state, so we need to manually update the state
@@ -794,6 +801,19 @@ impl AppClient {
     /// Check if a device belongs to a session replaced by a newer one
     fn is_stale_device(&self, device_id: &str) -> bool {
         self.stale_device_ids.lock().contains(device_id)
+    }
+
+    /// The integrated device's ID, if the integrated player is running
+    #[cfg_attr(
+        not(feature = "streaming"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
+    async fn integrated_device_id(&self) -> Option<String> {
+        #[cfg(feature = "streaming")]
+        if self.stream_conn.lock().is_some() {
+            return Some(self.spotify.session().await.device_id().to_string());
+        }
+        None
     }
 
     /// Retarget a playback still pointing at a replaced session's device to the current
