@@ -356,9 +356,11 @@ cargo install spotify_player --features notify
 
 Left-click the playback status icon to pause or resume playback, or click the progress bar to seek.
 Click a window to focus it and select the item under the cursor. Double-click an item to activate it,
-equivalent to choosing the selected item. Popup lists support the same click and double-click behavior;
-playlist fields and confirmation buttons can also be clicked. Use the mouse wheel to scroll queue,
-command-help, logs, and popup lists.
+equivalent to choosing the selected item. Right-click an item to open its actions popup. Popup lists
+support the same click and double-click behavior, and clicking outside a list popup closes it;
+playlist fields and confirmation buttons can also be clicked. The item under the cursor is highlighted
+(see the `hover` component style). The mouse wheel scrolls the list or page under the cursor; over the
+playback window, it changes the volume if `enable_mouse_scroll_volume` is enabled.
 
 ### Daemon
 

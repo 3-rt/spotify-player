@@ -2,15 +2,15 @@ use crate::{
     config,
     state::{
         Album, Artist, ArtistFocusState, BrowsePageUIState, Context, ContextPageUIState,
-        DataReadGuard, Id, LibraryFocusState, MutableWindowState, PageState, PageType,
-        PlaybackMetadata, PlaylistCreateCurrentField, PlaylistFolderItem, PlaylistPopupAction,
-        PopupState, SearchFocusState, SharedState, Track, UIStateGuard,
+        DataReadGuard, Id, LibraryFocusState, MouseArea, MouseTarget, MutableWindowState,
+        PageState, PageType, PlaybackMetadata, PlaylistCreateCurrentField, PlaylistFolderItem,
+        PlaylistPopupAction, PopupState, SearchFocusState, SharedState, Track, UIStateGuard,
     },
 };
 use anyhow::{Context as AnyhowContext, Result};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
         Block, BorderType, Borders, Cell, Gauge, LineGauge, List, ListItem, ListState, Paragraph,
@@ -144,13 +144,84 @@ fn render_application(frame: &mut Frame, state: &SharedState, ui: &mut UIStateGu
     // render playback window before other popups and windows to ensure nothing is rendered on top
     // of the playback window, which is to avoid "duplicated images" issue
     // See: https://github.com/aome510/spotify-player/issues/498
+    let full_rect = rect;
     let rect = playback::render_playback_window(frame, state, ui, rect);
+    // registered first so that the interactive regions inside the window take precedence
+    if let Some(playback_rect) = carved_rect(full_rect, rect) {
+        ui.mouse_areas.insert(
+            0,
+            MouseArea {
+                rect: playback_rect,
+                target: MouseTarget::PlaybackWindow,
+            },
+        );
+    }
 
     let rect = popup::render_shortcut_help_popup(frame, ui, rect);
 
+    let n_areas = ui.mouse_areas.len();
+    let full_rect = rect;
     let (rect, is_active) = popup::render_popup(frame, state, ui, rect);
+    if ui.has_focused_popup() {
+        if let Some(popup_rect) = carved_rect(full_rect, rect) {
+            ui.mouse_areas.insert(
+                n_areas,
+                MouseArea {
+                    rect: popup_rect,
+                    target: MouseTarget::PopupWindow,
+                },
+            );
+        }
+    }
 
     render_main_layout(is_active, frame, state, ui, rect);
+
+    render_mouse_hover(frame, ui);
+}
+
+/// The part of `outer` taken by a window rendered at its top or bottom, leaving `remaining`
+fn carved_rect(outer: Rect, remaining: Rect) -> Option<Rect> {
+    let rect = if remaining.y > outer.y {
+        Rect::new(outer.x, outer.y, outer.width, remaining.y - outer.y)
+    } else {
+        Rect::new(
+            outer.x,
+            remaining.bottom(),
+            outer.width,
+            outer.bottom().saturating_sub(remaining.bottom()),
+        )
+    };
+    (rect.height > 0).then_some(rect)
+}
+
+/// Highlight the item or button under the mouse pointer
+fn render_mouse_hover(frame: &mut Frame, ui: &UIStateGuard) {
+    let Some((column, row)) = ui.mouse_position else {
+        return;
+    };
+    let Some(area) = ui.mouse_area_at(column, row) else {
+        return;
+    };
+    let rect = match area.target {
+        MouseTarget::ResumePause | MouseTarget::ConfirmAction(_) => area.rect,
+        _ if area.item_at(row).is_some() => Rect::new(area.rect.x, row, area.rect.width, 1),
+        _ => return,
+    };
+
+    let style = ui.theme.hover();
+    let app_bg = ui.theme.app().bg.unwrap_or(Color::Reset);
+    let buffer = frame.buffer_mut();
+    for position in rect.positions() {
+        let Some(cell) = buffer.cell_mut(position) else {
+            continue;
+        };
+        // keep the selection's highlight
+        let has_own_bg = cell.bg != app_bg && cell.bg != Color::Reset;
+        if cell.modifier.contains(Modifier::REVERSED) || has_own_bg {
+            continue;
+        }
+        cell.set_style(style);
+    }
 }
 
 /// Render the application's main layout
@@ -202,6 +273,79 @@ impl Orientation {
         match self {
             Self::Vertical => Layout::vertical(constraints),
             Self::Horizontal => Layout::horizontal(constraints),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{LibraryFocusState, UIState};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn carved_rect_finds_windows_at_the_top_or_bottom() {
+        let outer = Rect::new(0, 0, 80, 40);
+        assert_eq!(
+            carved_rect(outer, Rect::new(0, 8, 80, 32)),
+            Some(Rect::new(0, 0, 80, 8))
+        );
+        assert_eq!(
+            carved_rect(outer, Rect::new(0, 0, 80, 30)),
+            Some(Rect::new(0, 30, 80, 10))
+        );
+        assert_eq!(carved_rect(outer, outer), None);
+    }
+
+    fn render_hover(mouse_position: Option<(u16, u16)>) -> ratatui::buffer::Buffer {
+        let ui = parking_lot::Mutex::new(UIState::default());
+        let mut ui = ui.lock();
+        ui.mouse_areas.push(MouseArea {
+            rect: Rect::new(1, 1, 10, 3),
+            target: MouseTarget::LibraryWindow {
+                focus: LibraryFocusState::Playlists,
+                first_item: 0,
+                item_count: 2,
+            },
+        });
+        ui.mouse_position = mouse_position;
+
+        let mut terminal = Terminal::new(TestBackend::new(12, 5)).unwrap();
+        terminal
+            .draw(|frame| {
+                // the selected row
+                frame.buffer_mut().set_style(
+                    Rect::new(1, 2, 10, 1),
+                    Style::new().add_modifier(Modifier::REVERSED),
+                );
+                render_mouse_hover(frame, &ui);
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn hover_highlights_the_item_row_under_the_pointer() {
+        let hover = UIState::default().theme.hover();
+        let buffer = render_hover(Some((4, 1)));
+
+        assert!((1..11).all(|x| buffer[(x, 1)].bg == hover.bg.unwrap()));
+        assert_eq!(buffer[(0, 1)].bg, Color::Reset);
+        assert_eq!(buffer[(11, 1)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn hover_keeps_the_selection_highlight() {
+        let buffer = render_hover(Some((4, 2)));
+
+        assert!((1..11).all(|x| buffer[(x, 2)].bg == Color::Reset));
+    }
+
+    #[test]
+    fn hover_ignores_rows_without_items_and_a_missing_pointer() {
+        for position in [Some((4, 3)), None] {
+            let buffer = render_hover(position);
+            assert!(buffer.content.iter().all(|cell| cell.bg == Color::Reset));
         }
     }
 }

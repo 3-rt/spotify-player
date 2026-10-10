@@ -23,6 +23,10 @@ pub use popup::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MouseTarget {
     ResumePause,
+    /// The whole playback window, where scrolling changes the volume
+    PlaybackWindow,
+    /// The whole focused popup, so clicks inside it don't count as clicks outside
+    PopupWindow,
     LibraryWindow {
         focus: LibraryFocusState,
         first_item: usize,
@@ -57,6 +61,8 @@ impl MouseTarget {
         matches!(
             self,
             Self::ResumePause
+                | Self::PlaybackWindow
+                | Self::PopupWindow
                 | Self::PopupList { .. }
                 | Self::PlaylistCreateField(_)
                 | Self::ConfirmAction(_)
@@ -113,6 +119,8 @@ impl MouseArea {
                 item_count,
             } => (first_item, item_count),
             MouseTarget::ResumePause
+            | MouseTarget::PlaybackWindow
+            | MouseTarget::PopupWindow
             | MouseTarget::SearchInput
             | MouseTarget::PlaylistCreateField(_)
             | MouseTarget::ConfirmAction(_)
@@ -162,6 +170,10 @@ pub struct UIState {
     pub mouse_areas: Vec<MouseArea>,
 
     last_mouse_click: Option<(MouseClickTarget, std::time::Instant)>,
+
+    /// The mouse pointer's last position (column, row), used to highlight the item under it.
+    /// Cleared on key presses so the highlight doesn't compete with keyboard navigation.
+    pub mouse_position: Option<(u16, u16)>,
 
     /// Count prefix for vim-style navigation (e.g., 5j, 10k)
     pub count_prefix: Option<usize>,
@@ -217,6 +229,19 @@ impl UIState {
         }
     }
 
+    /// The topmost interactive region at a position. A focused popup masks the page under it.
+    pub fn mouse_area_at(&self, column: u16, row: u16) -> Option<MouseArea> {
+        let has_focused_popup = self.has_focused_popup();
+        self.mouse_areas
+            .iter()
+            .rev()
+            .find(|area| {
+                area.contains(column, row)
+                    && (!has_focused_popup || area.target.is_available_with_focused_popup())
+            })
+            .copied()
+    }
+
     pub fn register_mouse_click(&mut self, target: MouseClickTarget) -> bool {
         self.register_mouse_click_at(target, std::time::Instant::now())
     }
@@ -269,6 +294,8 @@ impl Default for UIState {
             mouse_areas: Vec::new(),
 
             last_mouse_click: None,
+
+            mouse_position: None,
 
             count_prefix: None,
 
@@ -369,6 +396,36 @@ mod tests {
         assert!(MouseTarget::ConfirmAction(true).is_available_with_focused_popup());
         assert!(!MouseTarget::SearchInput.is_available_with_focused_popup());
         assert!(!MouseTarget::ScrollablePage.is_available_with_focused_popup());
+    }
+
+    #[test]
+    fn mouse_area_at_prefers_the_topmost_area() {
+        let mut ui = UIState::default();
+        let button = MouseArea {
+            rect: Rect::new(12, 6, 3, 1),
+            target: MouseTarget::ResumePause,
+        };
+        ui.mouse_areas = vec![library_area(0, 4), button];
+
+        assert_eq!(ui.mouse_area_at(13, 6), Some(button));
+        assert_eq!(ui.mouse_area_at(11, 6), Some(library_area(0, 4)));
+        assert_eq!(ui.mouse_area_at(0, 0), None);
+    }
+
+    #[test]
+    fn focused_popup_masks_page_windows_but_not_the_popup_window() {
+        let mut ui = UIState::default();
+        let popup_window = MouseArea {
+            rect: Rect::new(0, 7, 40, 3),
+            target: MouseTarget::PopupWindow,
+        };
+        ui.mouse_areas = vec![library_area(0, 4), popup_window];
+        ui.popup = Some(PopupState::DeviceList(
+            ratatui::widgets::ListState::default(),
+        ));
+
+        assert_eq!(ui.mouse_area_at(12, 5), None);
+        assert_eq!(ui.mouse_area_at(12, 8), Some(popup_window));
     }
 
     #[test]
