@@ -94,6 +94,7 @@ struct ComponentStyle {
     playlist_desc: Option<Style>,
     table_header: Option<Style>,
     selection: Option<Style>,
+    hover: Option<Style>,
     secondary_row: Option<Style>,
     like: Option<Style>,
     lyrics_played: Option<Style>,
@@ -211,6 +212,14 @@ impl Theme {
         } else {
             style::Style::default()
         }
+    }
+
+    pub fn hover(&self) -> style::Style {
+        self.component_style
+            .hover
+            .as_ref()
+            .unwrap_or(&Style::default().bg(StyleColor::BrightBlack))
+            .style(&self.palette)
     }
 
     pub fn block_title(&self) -> style::Style {

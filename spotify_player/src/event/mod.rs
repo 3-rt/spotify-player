@@ -12,10 +12,11 @@ use crate::{
         ActionListItem, Album, AlbumId, Artist, ArtistFocusState, ArtistId, ArtistPopupAction,
         BrowsePageUIState, ConfirmableAction, Context, ContextId, ContextPageType,
         ContextPageUIState, DataReadGuard, Focusable, Id, Item, ItemId, LibraryFocusState,
-        LibraryPageUIState, PageState, PageType, PlayableId, Playback, PlaylistCreateCurrentField,
-        PlaylistFolderItem, PlaylistId, PlaylistPopupAction, PopupState, SearchFocusState,
-        SearchPageUIState, SharedState, ShowId, Track, TrackId, TrackOrder, TracksId, UIStateGuard,
-        USER_LIKED_TRACKS_ID, USER_RECENTLY_PLAYED_TRACKS_ID, USER_TOP_TRACKS_ID,
+        LibraryPageUIState, MouseClickTarget, MouseTarget, PageState, PageType, PlayableId,
+        Playback, PlaylistCreateCurrentField, PlaylistFolderItem, PlaylistId, PlaylistPopupAction,
+        PopupState, SearchFocusState, SearchPageUIState, SharedState, ShowId, Track, TrackId,
+        TrackOrder, TracksId, UIStateGuard, USER_LIKED_TRACKS_ID, USER_RECENTLY_PLAYED_TRACKS_ID,
+        USER_TOP_TRACKS_ID,
     },
     ui::{single_line_input::LineInput, Orientation},
     utils::parse_uri,
@@ -67,31 +68,18 @@ fn handle_mouse_event(
     client_pub: &flume::Sender<ClientRequest>,
     state: &SharedState,
 ) -> Result<()> {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
     tracing::debug!("Handling mouse event: {event:?}");
 
-    let enable_scroll = config::get_config().app_config.enable_mouse_scroll_volume;
-
     match event.kind {
-        crossterm::event::MouseEventKind::ScrollUp if enable_scroll => {
-            let step = config::get_config().app_config.volume_scroll_step;
-            if let Some(ref playback) = state.player.read().buffered_playback {
-                if let Some(volume) = playback.volume {
-                    let new_volume = std::cmp::min(volume as u8 + step, 100);
-                    client_pub.send(ClientRequest::Player(PlayerRequest::Volume(new_volume)))?;
-                }
-            }
+        MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+            state.ui.lock().mouse_position = Some((event.column, event.row));
         }
-        crossterm::event::MouseEventKind::ScrollDown if enable_scroll => {
-            let step = config::get_config().app_config.volume_scroll_step;
-            if let Some(ref playback) = state.player.read().buffered_playback {
-                if let Some(volume) = playback.volume {
-                    let new_volume = (volume as u8).saturating_sub(step);
-                    client_pub.send(ClientRequest::Player(PlayerRequest::Volume(new_volume)))?;
-                }
-            }
-        }
-        // a left click event
-        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+        MouseEventKind::ScrollUp => handle_mouse_scroll(event, true, client_pub, state)?,
+        MouseEventKind::ScrollDown => handle_mouse_scroll(event, false, client_pub, state)?,
+        MouseEventKind::Down(MouseButton::Left) => {
+            state.ui.lock().mouse_position = Some((event.column, event.row));
             let rect = state.ui.lock().playback_progress_bar_rect;
             if event.row == rect.y && event.column >= rect.x && event.column < rect.x + rect.width {
                 // calculate the seek position (in ms) based on the mouse click position,
@@ -110,11 +98,306 @@ fn handle_mouse_event(
                         chrono::Duration::try_milliseconds(position_ms).unwrap(),
                     )))?;
                 }
+            } else {
+                let area = state.ui.lock().mouse_area_at(event.column, event.row);
+                match area {
+                    Some(area) => {
+                        if handle_mouse_area_click(area, event.row, client_pub, state)? {
+                            let mut ui = state.ui.lock();
+                            if matches!(area.target, MouseTarget::PopupList { .. }) {
+                                popup::handle_command_for_popup(
+                                    Command::ChooseSelected,
+                                    client_pub,
+                                    state,
+                                    &mut ui,
+                                )?;
+                            } else {
+                                page::handle_command_for_page(
+                                    Command::ChooseSelected,
+                                    client_pub,
+                                    state,
+                                    &mut ui,
+                                )?;
+                            }
+                        }
+                    }
+                    None => close_popup_on_outside_click(client_pub, state, &mut state.ui.lock())?,
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            state.ui.lock().mouse_position = Some((event.column, event.row));
+            let mut ui = state.ui.lock();
+            match ui.mouse_area_at(event.column, event.row) {
+                Some(area) if is_page_window(area.target) => {
+                    if select_mouse_area_item(area, event.row, &mut ui).is_some() {
+                        page::handle_command_for_page(
+                            Command::ShowActionsOnSelectedItem,
+                            client_pub,
+                            state,
+                            &mut ui,
+                        )?;
+                    }
+                }
+                Some(_) => {}
+                None => close_popup_on_outside_click(client_pub, state, &mut ui)?,
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+fn is_page_window(target: MouseTarget) -> bool {
+    matches!(
+        target,
+        MouseTarget::LibraryWindow { .. }
+            | MouseTarget::SearchWindow { .. }
+            | MouseTarget::ContextWindow { .. }
+            | MouseTarget::BrowseWindow { .. }
+    )
+}
+
+/// Scroll the list under the mouse pointer, or change the volume over the playback window
+fn handle_mouse_scroll(
+    event: crossterm::event::MouseEvent,
+    up: bool,
+    client_pub: &flume::Sender<ClientRequest>,
+    state: &SharedState,
+) -> Result<()> {
+    let command = if up {
+        Command::SelectPreviousOrScrollUp
+    } else {
+        Command::SelectNextOrScrollDown
+    };
+    let mut ui = state.ui.lock();
+    let Some(area) = ui.mouse_area_at(event.column, event.row) else {
+        return Ok(());
+    };
+    match area.target {
+        MouseTarget::ResumePause | MouseTarget::PlaybackWindow => {
+            drop(ui);
+            if config::get_config().app_config.enable_mouse_scroll_volume {
+                change_volume_from_mouse_scroll(up, client_pub, state)?;
+            }
+        }
+        MouseTarget::PopupList { .. } => {
+            popup::handle_command_for_popup(command, client_pub, state, &mut ui)?;
+        }
+        MouseTarget::ScrollablePage => {
+            page::handle_command_for_page(command, client_pub, state, &mut ui)?;
+        }
+        target if is_page_window(target) => {
+            focus_mouse_area_window(area, &mut ui);
+            page::handle_command_for_page(command, client_pub, state, &mut ui)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn change_volume_from_mouse_scroll(
+    increase: bool,
+    client_pub: &flume::Sender<ClientRequest>,
+    state: &SharedState,
+) -> Result<()> {
+    let step = config::get_config().app_config.volume_scroll_step;
+    if let Some(ref playback) = state.player.read().buffered_playback {
+        if let Some(volume) = playback.volume {
+            let new_volume = if increase {
+                std::cmp::min(volume as u8 + step, 100)
+            } else {
+                (volume as u8).saturating_sub(step)
+            };
+            client_pub.send(ClientRequest::Player(PlayerRequest::Volume(new_volume)))?;
+        }
+    }
+    Ok(())
+}
+
+/// Close a focused list popup (e.g. the actions popup) on a click outside it
+fn close_popup_on_outside_click(
+    client_pub: &flume::Sender<ClientRequest>,
+    state: &SharedState,
+    ui: &mut UIStateGuard,
+) -> Result<()> {
+    // other popups hold typed input or await an explicit answer
+    if ui.has_focused_popup() && ui.popup.as_ref().is_some_and(|p| p.list_state().is_some()) {
+        popup::handle_command_for_popup(Command::ClosePopup, client_pub, state, ui)?;
+    }
+    Ok(())
+}
+
+/// Focus the window containing a mouse area
+fn focus_mouse_area_window(area: crate::state::MouseArea, ui: &mut UIStateGuard) {
+    match (area.target, ui.current_page_mut()) {
+        (MouseTarget::LibraryWindow { focus, .. }, PageState::Library { state }) => {
+            state.focus = focus;
+        }
+        (MouseTarget::SearchWindow { focus, .. }, PageState::Search { state, .. }) => {
+            state.focus = focus;
+        }
+        (MouseTarget::SearchInput, PageState::Search { state, .. }) => {
+            state.focus = SearchFocusState::Input;
+        }
+        (
+            MouseTarget::ContextWindow {
+                focus: Some(focus), ..
+            },
+            PageState::Context {
+                state:
+                    Some(ContextPageUIState::Artist {
+                        focus: page_focus, ..
+                    }),
+                ..
+            },
+        ) => *page_focus = focus,
+        _ => {}
+    }
+}
+
+/// Focus the window containing a mouse area and select the item at `row`, if any
+fn select_mouse_area_item(
+    area: crate::state::MouseArea,
+    row: u16,
+    ui: &mut UIStateGuard,
+) -> Option<MouseClickTarget> {
+    focus_mouse_area_window(area, ui);
+    let item = area.item_at(row)?;
+    match area.target {
+        MouseTarget::LibraryWindow { focus, .. } => {
+            let PageState::Library { state } = ui.current_page_mut() else {
+                return None;
+            };
+            match focus {
+                LibraryFocusState::Playlists => state.playlist_list.select(Some(item)),
+                LibraryFocusState::SavedAlbums => state.saved_album_list.select(Some(item)),
+                LibraryFocusState::FollowedArtists => {
+                    state.followed_artist_list.select(Some(item));
+                }
+            }
+            Some(MouseClickTarget::Library(focus, item))
+        }
+        MouseTarget::SearchWindow { focus, .. } => {
+            let PageState::Search { state, .. } = ui.current_page_mut() else {
+                return None;
+            };
+            match focus {
+                SearchFocusState::Input => {}
+                SearchFocusState::Tracks => state.track_list.select(Some(item)),
+                SearchFocusState::Albums => state.album_list.select(Some(item)),
+                SearchFocusState::Artists => state.artist_list.select(Some(item)),
+                SearchFocusState::Playlists => state.playlist_list.select(Some(item)),
+                SearchFocusState::Shows => state.show_list.select(Some(item)),
+                SearchFocusState::Episodes => state.episode_list.select(Some(item)),
+            }
+            Some(MouseClickTarget::Search(focus, item))
+        }
+        MouseTarget::ContextWindow { focus, .. } => {
+            let PageState::Context {
+                state: Some(page_state),
+                ..
+            } = ui.current_page_mut()
+            else {
+                return None;
+            };
+            match (page_state, focus) {
+                (
+                    ContextPageUIState::Artist {
+                        top_track_table, ..
+                    },
+                    Some(ArtistFocusState::TopTracks),
+                ) => top_track_table.select(Some(item)),
+                (
+                    ContextPageUIState::Artist {
+                        liked_track_table, ..
+                    },
+                    Some(ArtistFocusState::LikedSongs),
+                ) => liked_track_table.select(Some(item)),
+                (
+                    ContextPageUIState::Artist { album_table, .. },
+                    Some(ArtistFocusState::Albums),
+                ) => {
+                    album_table.select(Some(item));
+                }
+                (
+                    ContextPageUIState::Artist {
+                        related_artist_list,
+                        ..
+                    },
+                    Some(ArtistFocusState::RelatedArtists),
+                ) => related_artist_list.select(Some(item)),
+                (
+                    ContextPageUIState::Playlist { track_table }
+                    | ContextPageUIState::Album { track_table }
+                    | ContextPageUIState::Tracks { track_table },
+                    None,
+                ) => track_table.select(Some(item)),
+                (ContextPageUIState::Show { episode_table }, None) => {
+                    episode_table.select(Some(item));
+                }
+                _ => return None,
+            }
+            Some(MouseClickTarget::Context(focus, item))
+        }
+        MouseTarget::BrowseWindow { .. } => {
+            let PageState::Browse { state } = ui.current_page_mut() else {
+                return None;
+            };
+            match state {
+                BrowsePageUIState::CategoryList { state }
+                | BrowsePageUIState::CategoryPlaylistList { state, .. } => {
+                    state.select(Some(item));
+                }
+            }
+            Some(MouseClickTarget::Browse(item))
+        }
+        MouseTarget::PopupList { .. } => {
+            ui.popup.as_mut()?.list_select(Some(item));
+            Some(MouseClickTarget::Popup(item))
+        }
+        _ => None,
+    }
+}
+
+/// Handle a left click on a mouse area, returning whether it's a double click on an item
+fn handle_mouse_area_click(
+    area: crate::state::MouseArea,
+    row: u16,
+    client_pub: &flume::Sender<ClientRequest>,
+    state: &SharedState,
+) -> Result<bool> {
+    match area.target {
+        MouseTarget::ResumePause => {
+            client_pub.send(ClientRequest::Player(PlayerRequest::ResumePause))?;
+            Ok(false)
+        }
+        MouseTarget::PlaylistCreateField(field) => {
+            let mut ui = state.ui.lock();
+            let Some(PopupState::PlaylistCreate { current_field, .. }) = ui.popup.as_mut() else {
+                return Ok(false);
+            };
+            *current_field = field;
+            Ok(false)
+        }
+        MouseTarget::ConfirmAction(confirmed) => {
+            let action = {
+                let ui = state.ui.lock();
+                let Some(PopupState::ConfirmAction { action, .. }) = ui.popup.as_ref() else {
+                    return Ok(false);
+                };
+                action.clone()
+            };
+            let mut ui = state.ui.lock();
+            popup::handle_confirmation(confirmed, client_pub, &mut ui, action)?;
+            Ok(false)
+        }
+        _ => {
+            let mut ui = state.ui.lock();
+            Ok(select_mouse_area_item(area, row, &mut ui)
+                .is_some_and(|target| ui.register_mouse_click(target)))
+        }
+    }
 }
 
 // Handle a terminal key pressed event
@@ -123,6 +406,7 @@ fn handle_key_event(
     client_pub: &flume::Sender<ClientRequest>,
     state: &SharedState,
 ) -> Result<()> {
+    state.ui.lock().mouse_position = None;
     let key: Key = event.into();
     let mut ui = state.ui.lock();
 
